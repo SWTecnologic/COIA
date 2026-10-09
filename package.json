@@ -1,0 +1,16 @@
+{
+  "name": "coia-workspace",
+  "private": true,
+  "scripts": {
+    "motor": "cd COIA && .venv/bin/python -m uvicorn app.main:app --reload --port 8000",
+    "worker": "cd COIA && .venv/bin/python -m app.worker",
+    "dashboard": "cd \"Dashboard COIA\" && npm run dev",
+    "dev": "concurrently -n motor,worker,dash -c blue,magenta,green \"npm:motor\" \"npm:worker\" \"npm:dashboard\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.0"
+  },
+  "dependencies": {
+    "expo": "~54.0.0"
+  }
+}
