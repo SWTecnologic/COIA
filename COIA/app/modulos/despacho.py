@@ -1,47 +1,48 @@
+
 """
-despacho.py — Escolha da equipe apta para uma ocorrência
+despacho.py — Escolha e despacho automático de equipes.
 
-Etapa A (FILTRO DE ELEGIBILIDADE):
-  Elimina equipes que NÃO PODEM atender (falta de habilitação, especialidade,
-  equipamento ou veículo inadequado). Não adianta estar perto se não pode.
+Etapa A: filtra equipes elegíveis de acordo com especialidades,
+habilitações, veículo e equipamentos necessários.
 
-Etapa B (RANKING POR SCORE):
-  Entre as equipes elegíveis, calcula pontuação:
+Etapa B: classifica as equipes elegíveis por pontuação:
     40% proximidade
-    20% match de especialidade
-    15% match de habilitação
-    15% match de equipamento
-    10% bônus de mesma região
+    20% especialidade
+    15% habilitação
+    15% equipamento
+    10% mesma região
+
+Etapa C: salva o ranking, atualiza a recomendação da ocorrência
+e cria uma oferta em despachos_ocorrencias para a melhor equipe.
 """
+
+from datetime import datetime, timedelta, timezone
 
 from app.db import sb
 from app.modulos.correlacao import haversine_m
 
+
 # ============================================================
-# REGRAS: o que cada tipo de ocorrência EXIGE
+# REGRAS DE ELEGIBILIDADE
 # ============================================================
-# - especialidades: códigos que a equipe DEVE ter (pelo menos 1)
-# - habilitacoes: códigos que pelo menos 1 técnico DEVE ter
-# - veiculo_contem: substring do tipo de veículo obrigatório
-# - equipamento_categoria: categoria de equipamento obrigatória
 
 REQUISITOS = {
     "poste_danificado": {
         "especialidades": ["ESP-001", "ESP-002"],
-        "habilitacoes": ["HAB-003"],           # NR-35 trabalho em altura
+        "habilitacoes": ["HAB-003"],
         "veiculo_contem": None,
         "equipamento_categoria": None,
         "descricao": "Poste danificado exige trabalho em altura (NR-35)",
     },
     "transformador": {
-        "especialidades": ["ESP-004"],          # Transformadores
-        "habilitacoes": ["HAB-001"],            # NR-10
-        "veiculo_contem": "cesta",              # Caminhão cesta
+        "especialidades": ["ESP-004"],
+        "habilitacoes": ["HAB-001"],
+        "veiculo_contem": "cesta",
         "equipamento_categoria": None,
         "descricao": "Transformador exige caminhão cesta e especialidade",
     },
     "cabo_rompido": {
-        "especialidades": ["ESP-001"],          # Rede Primária
+        "especialidades": ["ESP-001"],
         "habilitacoes": ["HAB-001"],
         "veiculo_contem": None,
         "equipamento_categoria": None,
@@ -55,7 +56,7 @@ REQUISITOS = {
         "descricao": "Cabo no solo exige rede primária ou secundária",
     },
     "curto_circuito": {
-        "especialidades": ["ESP-001", "ESP-006"],   # Rede Primária ou Manobras
+        "especialidades": ["ESP-001", "ESP-006"],
         "habilitacoes": ["HAB-001"],
         "veiculo_contem": None,
         "equipamento_categoria": None,
@@ -63,10 +64,10 @@ REQUISITOS = {
     },
     "arvore_sobre_rede": {
         "especialidades": ["ESP-002", "ESP-005"],
-        "habilitacoes": ["HAB-003"],            # NR-35 (subir pra podar)
+        "habilitacoes": ["HAB-003"],
         "veiculo_contem": None,
         "equipamento_categoria": None,
-        "descricao": "Árvore sobre rede exige NR-35 e rede secundária/altura",
+        "descricao": "Árvore sobre rede exige NR-35 e especialidade",
     },
     "falha_equipamento": {
         "especialidades": [],
@@ -99,56 +100,90 @@ REQUISITOS_PADRAO = {
     "descricao": "Sem requisitos específicos",
 }
 
+
 # ============================================================
-# HELPERS
+# CONSULTAS AUXILIARES
 # ============================================================
 
 def _buscar_dados_equipes(equipe_ids: list[str]) -> dict:
-    """Busca em lote tudo que precisa sobre as equipes."""
+    """Busca especialidades, equipamentos, técnicos e habilitações."""
+
     if not equipe_ids:
-        return {"especialidades": {}, "equipamentos": {}, "tecnicos": {}, "habilitacoes": {}}
+        return {
+            "especialidades": {},
+            "equipamentos": {},
+            "tecnicos": {},
+            "habilitacoes": {},
+        }
 
-    # Especialidades por equipe
-    esp_rows = (sb().table("equipe_especialidades")
-                  .select("equipe_id, especialidade_id, nivel, ativo")
-                  .in_("equipe_id", equipe_ids)
-                  .eq("ativo", True)
-                  .execute()).data or []
-    especialidades_map: dict[str, set] = {}
-    for r in esp_rows:
-        especialidades_map.setdefault(r["equipe_id"], set()).add(r["especialidade_id"])
+    especialidades_map = {}
+    equipamentos_map = {}
+    tecnicos_map = {}
+    habilitacoes_map = {}
 
-    # Equipamentos por equipe
-    eqp_rows = (sb().table("equipamentos_equipe")
-                  .select("equipe_id, categoria, status")
-                  .in_("equipe_id", equipe_ids)
-                  .execute()).data or []
-    equipamentos_map: dict[str, list] = {}
-    for r in eqp_rows:
-        equipamentos_map.setdefault(r["equipe_id"], []).append(r)
+    esp_rows = (
+        sb()
+        .table("equipe_especialidades")
+        .select("equipe_id, especialidade_id, nivel, ativo")
+        .in_("equipe_id", equipe_ids)
+        .eq("ativo", True)
+        .execute()
+        .data
+        or []
+    )
 
-    # Técnicos por equipe (via equipe_tecnicos)
-    et_rows = (sb().table("equipe_tecnicos")
-                 .select("equipe_id, tecnico_id")
-                 .in_("equipe_id", equipe_ids)
-                 .execute()).data or []
-    tecnicos_map: dict[str, list] = {}
+    for row in esp_rows:
+        especialidades_map.setdefault(row["equipe_id"], set()).add(
+            row["especialidade_id"]
+        )
+
+    eqp_rows = (
+        sb()
+        .table("equipamentos_equipe")
+        .select("equipe_id, categoria, status")
+        .in_("equipe_id", equipe_ids)
+        .execute()
+        .data
+        or []
+    )
+
+    for row in eqp_rows:
+        equipamentos_map.setdefault(row["equipe_id"], []).append(row)
+
+    tecnico_rows = (
+        sb()
+        .table("equipe_tecnicos")
+        .select("equipe_id, tecnico_id")
+        .in_("equipe_id", equipe_ids)
+        .execute()
+        .data
+        or []
+    )
+
     tecnico_ids = []
-    for r in et_rows:
-        tecnicos_map.setdefault(r["equipe_id"], []).append(r["tecnico_id"])
-        tecnico_ids.append(r["tecnico_id"])
 
-    # Habilitações dos técnicos
-    hab_rows = []
+    for row in tecnico_rows:
+        tecnicos_map.setdefault(row["equipe_id"], []).append(
+            row["tecnico_id"]
+        )
+        tecnico_ids.append(row["tecnico_id"])
+
     if tecnico_ids:
-        hab_rows = (sb().table("tecnico_habilitacoes")
-                      .select("tecnico_id, habilitacao_id, status")
-                      .in_("tecnico_id", tecnico_ids)
-                      .eq("status", "valida")
-                      .execute()).data or []
-    habilitacoes_map: dict[str, set] = {}
-    for r in hab_rows:
-        habilitacoes_map.setdefault(r["tecnico_id"], set()).add(r["habilitacao_id"])
+        hab_rows = (
+            sb()
+            .table("tecnico_habilitacoes")
+            .select("tecnico_id, habilitacao_id, status")
+            .in_("tecnico_id", tecnico_ids)
+            .eq("status", "valida")
+            .execute()
+            .data
+            or []
+        )
+
+        for row in hab_rows:
+            habilitacoes_map.setdefault(row["tecnico_id"], set()).add(
+                row["habilitacao_id"]
+            )
 
     return {
         "especialidades": especialidades_map,
@@ -157,6 +192,10 @@ def _buscar_dados_equipes(equipe_ids: list[str]) -> dict:
         "habilitacoes": habilitacoes_map,
     }
 
+
+# ============================================================
+# ELEGIBILIDADE
+# ============================================================
 
 def _avaliar_elegibilidade(
     eq: dict,
@@ -167,7 +206,8 @@ def _avaliar_elegibilidade(
     habilitacoes_por_tecnico: dict,
     veiculo: dict | None,
 ) -> tuple[bool, str | None, dict]:
-    """Retorna (elegivel, motivo_inelegibilidade, detalhes)."""
+    """Determina se a equipe pode atender à ocorrência."""
+
     detalhes = {
         "especialidades_ok": True,
         "habilitacoes_ok": True,
@@ -175,55 +215,84 @@ def _avaliar_elegibilidade(
         "equipamento_ok": True,
     }
 
-    # --- Especialidade ---
-    esp_necessarias = req.get("especialidades") or []
-    if esp_necessarias:
-        if not (set(esp_necessarias) & especialidades_eq):
+    especialidades_necessarias = req.get("especialidades") or []
+
+    if especialidades_necessarias:
+        if not (
+            set(especialidades_necessarias) & especialidades_eq
+        ):
             detalhes["especialidades_ok"] = False
-            return False, (
-                f"Falta especialidade: precisa de uma entre "
-                f"{', '.join(esp_necessarias)}"
-            ), detalhes
 
-    # --- Habilitação ---
-    hab_necessarias = req.get("habilitacoes") or []
-    if hab_necessarias:
-        tem_alguma = False
-        for tid in tecnicos_eq:
-            if set(hab_necessarias) & habilitacoes_por_tecnico.get(tid, set()):
-                tem_alguma = True
-                break
-        if not tem_alguma:
+            return (
+                False,
+                "Falta especialidade: precisa de uma entre "
+                + ", ".join(especialidades_necessarias),
+                detalhes,
+            )
+
+    habilitacoes_necessarias = req.get("habilitacoes") or []
+
+    if habilitacoes_necessarias:
+        tem_habilitacao = any(
+            set(habilitacoes_necessarias)
+            & habilitacoes_por_tecnico.get(tecnico_id, set())
+            for tecnico_id in tecnicos_eq
+        )
+
+        if not tem_habilitacao:
             detalhes["habilitacoes_ok"] = False
-            return False, (
-                f"Nenhum técnico tem habilitação: "
-                f"{', '.join(hab_necessarias)}"
-            ), detalhes
 
-    # --- Veículo ---
-    veiculo_contem = req.get("veiculo_contem")
-    if veiculo_contem:
+            return (
+                False,
+                "Nenhum técnico tem habilitação: "
+                + ", ".join(habilitacoes_necessarias),
+                detalhes,
+            )
+
+    veiculo_necessario = req.get("veiculo_contem")
+
+    if veiculo_necessario:
         if not veiculo:
             detalhes["veiculo_ok"] = False
             return False, "Sem veículo designado", detalhes
-        tipo_veic = (veiculo.get("tipo") or "").lower()
-        if veiculo_contem.lower() not in tipo_veic:
-            detalhes["veiculo_ok"] = False
-            return False, (
-                f"Veículo inadequado (precisa {veiculo_contem}, "
-                f"tem {veiculo.get('tipo')})"
-            ), detalhes
 
-    # --- Equipamento ---
-    cat_nec = req.get("equipamento_categoria")
-    if cat_nec:
-        categorias = [e.get("categoria") for e in equipamentos_eq]
-        if cat_nec not in categorias:
+        tipo_veiculo = (veiculo.get("tipo") or "").lower()
+
+        if veiculo_necessario.lower() not in tipo_veiculo:
+            detalhes["veiculo_ok"] = False
+
+            return (
+                False,
+                f"Veículo inadequado: precisa conter "
+                f"'{veiculo_necessario}', tipo cadastrado: "
+                f"'{veiculo.get('tipo')}'",
+                detalhes,
+            )
+
+    categoria_necessaria = req.get("equipamento_categoria")
+
+    if categoria_necessaria:
+        categorias = [
+            equipamento.get("categoria")
+            for equipamento in equipamentos_eq
+            if equipamento.get("status") in (None, "operacional", "disponivel")
+        ]
+
+        if categoria_necessaria not in categorias:
             detalhes["equipamento_ok"] = False
-            return False, f"Falta equipamento da categoria {cat_nec}", detalhes
+
+            return (
+                False,
+                f"Falta equipamento da categoria {categoria_necessaria}",
+                detalhes,
+            )
 
     return True, None, detalhes
 
+
+# ============================================================
+# PONTUAÇÃO
+# ============================================================
 
 def _pontuar(
     elegivel: bool,
@@ -233,177 +302,465 @@ def _pontuar(
     eqp_match: bool,
     mesma_regiao: bool,
 ) -> float:
+    """Retorna score entre 0 e 1."""
+
     if not elegivel:
         return 0.0
 
-    # proximidade: 1.0 se dist=0, 0.0 se dist>=50km
-    prox = max(0.0, 1.0 - distancia_m / 50_000)
+    proximidade = max(0.0, 1.0 - distancia_m / 50_000)
 
     score = (
-        0.40 * prox
-        + 0.20 * (1.0 if esp_match else 0.4)   # quem casa ganha 100%; quem não casa (mas é elegível) ganha 40%
+        0.40 * proximidade
+        + 0.20 * (1.0 if esp_match else 0.4)
         + 0.15 * (1.0 if hab_match else 0.5)
         + 0.15 * (1.0 if eqp_match else 0.5)
         + 0.10 * (1.0 if mesma_regiao else 0.0)
     )
+
     return round(score, 3)
 
 
 # ============================================================
-# ENTRADA PRINCIPAL
+# CRIAÇÃO DA OFERTA DE DESPACHO
+# ============================================================
+
+def _criar_oferta(ocorrencia_id: str, top: dict) -> dict:
+    """
+    Cria uma oferta para a equipe selecionada.
+
+    Não duplica uma oferta pendente ou um despacho já aceito
+    para a mesma ocorrência.
+    """
+
+    existentes = (
+        sb()
+        .table("despachos_ocorrencias")
+        .select("id, equipe_id, status")
+        .eq("ocorrencia_id", ocorrencia_id)
+        .in_("status", ["ofertada", "aceita"])
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+
+    if existentes:
+        existente = existentes[0]
+
+        return {
+            "criado": False,
+            "motivo": "ja_existe_despacho_ativo",
+            "despacho_id": existente["id"],
+            "equipe_id": existente["equipe_id"],
+            "status": existente["status"],
+        }
+
+    agora = datetime.now(timezone.utc)
+    expiracao = agora + timedelta(minutes=10)
+
+    registro = {
+        "ocorrencia_id": ocorrencia_id,
+        "equipe_id": top["equipe_id"],
+        "posicao": 1,
+        "pontuacao": round(top["pontuacao"] * 100, 1),
+        "distancia_km": top["distancia_km"],
+        "eta_minutos": top["eta_minutos"],
+        "enviado_em": agora.isoformat(),
+        "expira_em": expiracao.isoformat(),
+        "status": "ofertada",
+        "motivo": (
+            f'{top["equipe_nome"]} selecionada pela IA'
+        ),
+        "detalhes": {
+            "origem": "despacho_automatico",
+            "pontuacao_original": top["pontuacao"],
+            "distancia_m": top["distancia_m"],
+            "elegivel": top["elegivel"],
+            "criterio": "melhor equipe elegível",
+        },
+    }
+
+    resultado = (
+        sb()
+        .table("despachos_ocorrencias")
+        .insert(registro)
+        .execute()
+    )
+
+    linhas = resultado.data or []
+
+    if not linhas:
+        # O cliente Supabase normalmente devolve a linha inserida.
+        # Se não devolver, verificamos se a oferta foi persistida.
+        verificacao = (
+            sb()
+            .table("despachos_ocorrencias")
+            .select("id, equipe_id, status")
+            .eq("ocorrencia_id", ocorrencia_id)
+            .eq("equipe_id", top["equipe_id"])
+            .eq("status", "ofertada")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+
+        if not verificacao:
+            raise RuntimeError(
+                "O Supabase não confirmou a criação do despacho."
+            )
+
+        linhas = verificacao
+
+    return {
+        "criado": True,
+        "motivo": "oferta_criada",
+        "despacho_id": linhas[0].get("id"),
+        "equipe_id": top["equipe_id"],
+        "status": "ofertada",
+    }
+
+
+# ============================================================
+# PROCESSAMENTO PRINCIPAL
 # ============================================================
 
 def processar(ocorrencia_id: str) -> dict:
-    oc = (sb().table("ocorrencias").select("*").eq("id", ocorrencia_id)
-            .single().execute()).data
-    if not oc:
-        return {"erro": "nao_encontrada"}
+    """Calcula ranking, atualiza recomendação e cria a oferta."""
+
+    ocorrencias = (
+        sb()
+        .table("ocorrencias")
+        .select("*")
+        .eq("id", ocorrencia_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+
+    if not ocorrencias:
+        return {
+            "erro": "nao_encontrada",
+            "ocorrencia_id": ocorrencia_id,
+        }
+
+    oc = ocorrencias[0]
+
+    if oc.get("latitude") is None or oc.get("longitude") is None:
+        return {
+            "erro": "coordenadas_ausentes",
+            "ocorrencia_id": ocorrencia_id,
+        }
 
     tipo = oc.get("tipo") or "outro"
-    req = REQUISITOS.get(tipo, REQUISITOS_PADRAO)
+    requisitos = REQUISITOS.get(tipo, REQUISITOS_PADRAO)
 
-    # 1. Equipes disponíveis
-    equipes = (sb().table("equipes").select("*")
-                 .eq("status", "disponivel").execute()).data or []
+    # 1. Equipes disponíveis.
+    equipes = (
+        sb()
+        .table("equipes")
+        .select("*")
+        .eq("status", "disponivel")
+        .execute()
+        .data
+        or []
+    )
 
     if not equipes:
-        # grava resultado vazio
-        sb().table("ia_recomendacoes_equipes").delete()\
-            .eq("ocorrencia_id", ocorrencia_id).execute()
+        (
+            sb()
+            .table("ia_recomendacoes_equipes")
+            .delete()
+            .eq("ocorrencia_id", ocorrencia_id)
+            .execute()
+        )
+
         return {
             "ocorrencia_id": ocorrencia_id,
+            "tipo": tipo,
             "top": None,
             "total_avaliadas": 0,
+            "elegiveis": 0,
+            "inelegiveis": 0,
+            "despacho_criado": False,
             "motivo": "Sem equipes disponíveis",
         }
 
-    equipe_ids = [e["id"] for e in equipes]
+    equipe_ids = [equipe["id"] for equipe in equipes]
 
-    # 2. Dados auxiliares em lote
+    # 2. Dados auxiliares.
     dados = _buscar_dados_equipes(equipe_ids)
 
-    # 3. Última localização de cada equipe
-    locs = (sb().table("localizacoes_equipes").select("*")
-              .order("data_hora", desc=True).execute()).data or []
-    ult_loc: dict[str, dict] = {}
-    for l in locs:
-        ult_loc.setdefault(l["equipe_id"], l)
+    # 3. Última localização conhecida de cada equipe.
+    localizacoes = (
+        sb()
+        .table("localizacoes_equipes")
+        .select("*")
+        .in_("equipe_id", equipe_ids)
+        .order("data_hora", desc=True)
+        .execute()
+        .data
+        or []
+    )
 
-    # 4. Bases
-    bases = (sb().table("bases_operacionais").select("*").execute()).data or []
-    base_por_id = {b["id"]: b for b in bases}
+    ultima_localizacao = {}
 
-    # 5. Veículos
-    veiculos = (sb().table("veiculos").select("*").execute()).data or []
-    veiculo_por_id = {v["id"]: v for v in veiculos}
-
-    # 6. Avaliar cada equipe
-    ranking = []
-    for eq in equipes:
-        eid = eq["id"]
-
-        # Distância
-        loc = ult_loc.get(eid)
-        if loc:
-            d = haversine_m(oc["latitude"], oc["longitude"],
-                            loc["latitude"], loc["longitude"])
-        else:
-            b = base_por_id.get(eq["base_operacional_id"])
-            d = (haversine_m(oc["latitude"], oc["longitude"],
-                             b["latitude"], b["longitude"])
-                 if b else 999_000)
-
-        # Dados da equipe
-        esp_eq = dados["especialidades"].get(eid, set())
-        eqp_eq = dados["equipamentos"].get(eid, [])
-        tec_eq = dados["tecnicos"].get(eid, [])
-        hab_por_tec = dados["habilitacoes"]
-        veic = veiculo_por_id.get(eq.get("veiculo_id"))
-
-        # Elegibilidade
-        elegivel, motivo_ineleg, det = _avaliar_elegibilidade(
-            eq, req, esp_eq, eqp_eq, tec_eq, hab_por_tec, veic
+    for localizacao in localizacoes:
+        ultima_localizacao.setdefault(
+            localizacao["equipe_id"],
+            localizacao,
         )
 
-        # Matches (para pontuar)
-        esp_nec = req.get("especialidades") or []
-        hab_nec = req.get("habilitacoes") or []
-        cat_nec = req.get("equipamento_categoria")
+    # 4. Bases operacionais.
+    bases = (
+        sb()
+        .table("bases_operacionais")
+        .select("*")
+        .execute()
+        .data
+        or []
+    )
 
-        esp_match = bool(set(esp_nec) & esp_eq) if esp_nec else True
-        hab_match = False
-        if hab_nec:
-            for tid in tec_eq:
-                if set(hab_nec) & hab_por_tec.get(tid, set()):
-                    hab_match = True
-                    break
+    base_por_id = {
+        base["id"]: base
+        for base in bases
+    }
+
+    # 5. Veículos.
+    veiculos = (
+        sb()
+        .table("veiculos")
+        .select("*")
+        .execute()
+        .data
+        or []
+    )
+
+    veiculo_por_id = {
+        veiculo["id"]: veiculo
+        for veiculo in veiculos
+    }
+
+    # 6. Avaliar cada equipe.
+    ranking = []
+
+    for equipe in equipes:
+        equipe_id = equipe["id"]
+
+        localizacao = ultima_localizacao.get(equipe_id)
+
+        if localizacao:
+            distancia = haversine_m(
+                oc["latitude"],
+                oc["longitude"],
+                localizacao["latitude"],
+                localizacao["longitude"],
+            )
+        else:
+            base = base_por_id.get(
+                equipe.get("base_operacional_id")
+            )
+
+            if (
+                base
+                and base.get("latitude") is not None
+                and base.get("longitude") is not None
+            ):
+                distancia = haversine_m(
+                    oc["latitude"],
+                    oc["longitude"],
+                    base["latitude"],
+                    base["longitude"],
+                )
+            else:
+                distancia = 999_000
+
+        especialidades = dados["especialidades"].get(
+            equipe_id, set()
+        )
+
+        equipamentos = dados["equipamentos"].get(
+            equipe_id, []
+        )
+
+        tecnicos = dados["tecnicos"].get(
+            equipe_id, []
+        )
+
+        habilitacoes = dados["habilitacoes"]
+
+        veiculo = veiculo_por_id.get(
+            equipe.get("veiculo_id")
+        )
+
+        elegivel, motivo, detalhes = _avaliar_elegibilidade(
+            equipe,
+            requisitos,
+            especialidades,
+            equipamentos,
+            tecnicos,
+            habilitacoes,
+            veiculo,
+        )
+
+        especialidades_necessarias = (
+            requisitos.get("especialidades") or []
+        )
+
+        habilitacoes_necessarias = (
+            requisitos.get("habilitacoes") or []
+        )
+
+        categoria_necessaria = requisitos.get(
+            "equipamento_categoria"
+        )
+
+        esp_match = (
+            bool(set(especialidades_necessarias) & especialidades)
+            if especialidades_necessarias
+            else True
+        )
+
+        if habilitacoes_necessarias:
+            hab_match = any(
+                set(habilitacoes_necessarias)
+                & habilitacoes.get(tecnico_id, set())
+                for tecnico_id in tecnicos
+            )
         else:
             hab_match = True
-        eqp_match = True
-        if cat_nec:
-            eqp_match = any(e.get("categoria") == cat_nec for e in eqp_eq)
 
-        mesma_regiao = eq["regiao_id"] == oc["regiao_id"]
+        if categoria_necessaria:
+            eqp_match = any(
+                equipamento.get("categoria") == categoria_necessaria
+                and equipamento.get("status")
+                in (None, "operacional", "disponivel")
+                for equipamento in equipamentos
+            )
+        else:
+            eqp_match = True
 
-        pontuacao = _pontuar(
-            elegivel, d, esp_match, hab_match, eqp_match, mesma_regiao
+        mesma_regiao = (
+            equipe.get("regiao_id") == oc.get("regiao_id")
         )
 
-        eta = int(d / 1000 / 40 * 60) if d < 900_000 else None
+        pontuacao = _pontuar(
+            elegivel,
+            distancia,
+            esp_match,
+            hab_match,
+            eqp_match,
+            mesma_regiao,
+        )
+
+        eta = (
+            int(distancia / 1000 / 40 * 60)
+            if distancia < 900_000
+            else None
+        )
 
         ranking.append({
-            "equipe_id": eid,
-            "equipe_nome": eq["nome"],
+            "equipe_id": equipe_id,
+            "equipe_nome": equipe["nome"],
             "elegivel": elegivel,
-            "motivo_inelegibilidade": motivo_ineleg,
-            "distancia_m": d,
-            "distancia_km": round(d / 1000, 2),
+            "motivo_inelegibilidade": motivo,
+            "distancia_m": round(distancia, 2),
+            "distancia_km": round(distancia / 1000, 2),
             "eta_minutos": eta,
             "pontuacao": pontuacao,
-            "detalhes": det,
+            "detalhes": detalhes,
         })
 
-    # 7. Ordenar: elegíveis primeiro (por pontuação), depois inelegíveis
-    elegiveis = [r for r in ranking if r["elegivel"]]
-    inelegiveis = [r for r in ranking if not r["elegivel"]]
-    elegiveis.sort(key=lambda x: x["pontuacao"], reverse=True)
-    inelegiveis.sort(key=lambda x: x["distancia_m"])
-    final = elegiveis + inelegiveis
+    # 7. Elegíveis primeiro; dentro delas, maior pontuação primeiro.
+    elegiveis = [
+        item for item in ranking
+        if item["elegivel"]
+    ]
 
-    # 8. Limpar e gravar
-    sb().table("ia_recomendacoes_equipes").delete()\
-        .eq("ocorrencia_id", ocorrencia_id).execute()
+    inelegiveis = [
+        item for item in ranking
+        if not item["elegivel"]
+    ]
 
-    for i, r in enumerate(final[:15]):
-        sb().table("ia_recomendacoes_equipes").insert({
-            "ocorrencia_id": ocorrencia_id,
-            "equipe_id": r["equipe_id"],
-            "elegivel": r["elegivel"],
-            "motivo_inelegibilidade": r["motivo_inelegibilidade"],
-            "distancia_km": r["distancia_km"],
-            "eta_minutos": r["eta_minutos"],
-            "pontuacao": r["pontuacao"],
-            "posicao": i + 1,
-            "detalhes": {
-                **r["detalhes"],
-                "equipe_nome": r["equipe_nome"],
-                "motivo_regra": req.get("descricao"),
-            },
-        }).execute()
+    elegiveis.sort(
+        key=lambda item: item["pontuacao"],
+        reverse=True,
+    )
 
-    # 9. Top = melhor elegível
+    inelegiveis.sort(
+        key=lambda item: item["distancia_m"]
+    )
+
+    ranking_final = elegiveis + inelegiveis
+
+    # 8. Atualizar ranking da IA.
+    (
+        sb()
+        .table("ia_recomendacoes_equipes")
+        .delete()
+        .eq("ocorrencia_id", ocorrencia_id)
+        .execute()
+    )
+
+    for posicao, item in enumerate(ranking_final[:15], start=1):
+        (
+            sb()
+            .table("ia_recomendacoes_equipes")
+            .insert({
+                "ocorrencia_id": ocorrencia_id,
+                "equipe_id": item["equipe_id"],
+                "elegivel": item["elegivel"],
+                "motivo_inelegibilidade": (
+                    item["motivo_inelegibilidade"]
+                ),
+                "distancia_km": item["distancia_km"],
+                "eta_minutos": item["eta_minutos"],
+                "pontuacao": item["pontuacao"],
+                "posicao": posicao,
+                "detalhes": {
+                    **item["detalhes"],
+                    "equipe_nome": item["equipe_nome"],
+                    "motivo_regra": requisitos.get("descricao"),
+                },
+            })
+            .execute()
+        )
+
+    # 9. Selecionar a melhor equipe elegível.
     top = elegiveis[0] if elegiveis else None
+    resultado_despacho = {
+        "criado": False,
+        "motivo": "nenhuma_equipe_elegivel",
+    }
+
     if top:
-        sb().table("ocorrencias").update({
-            "ia_equipe_recomendada_id": top["equipe_id"],
-        }).eq("id", ocorrencia_id).execute()
+        # Persistir recomendação na ocorrência.
+        (
+            sb()
+            .table("ocorrencias")
+            .update({
+                "ia_equipe_recomendada_id": top["equipe_id"],
+            })
+            .eq("id", ocorrencia_id)
+            .execute()
+        )
+
+        # Criar oferta que o aplicativo de campo consulta.
+        resultado_despacho = _criar_oferta(
+            ocorrencia_id,
+            top,
+        )
 
     return {
         "ocorrencia_id": ocorrencia_id,
         "tipo": tipo,
-        "requisitos": req.get("descricao"),
+        "requisitos": requisitos.get("descricao"),
         "top": top,
-        "total_avaliadas": len(final),
+        "total_avaliadas": len(ranking_final),
         "elegiveis": len(elegiveis),
         "inelegiveis": len(inelegiveis),
+        "despacho_criado": resultado_despacho["criado"],
+        "despacho": resultado_despacho,
     }

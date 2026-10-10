@@ -8,7 +8,9 @@
     "dev": "concurrently -n motor,worker,dash -c blue,magenta,green \"npm:motor\" \"npm:worker\" \"npm:dashboard\""
   },
   "devDependencies": {
-    "concurrently": "^8.2.0"
+    "@types/react": "~19.1.10",
+    "concurrently": "^8.2.0",
+    "typescript": "~5.9.2"
   },
   "dependencies": {
     "expo": "~54.0.0"
